@@ -4,6 +4,7 @@ use builder::Builder;
 pub struct Foo {
     pub field_a: u32,
     pub field_b: bool,
+    #[builder(into)]
     pub field_c: String,
 }
 
@@ -11,7 +12,7 @@ fn main() {
     let x: Foo = Foo::builder()
         .field_a(69)
         .field_b(true)
-        .field_c(String::from("hello world"))
+        .field_c("hello world")
         .build()
         .unwrap();
 

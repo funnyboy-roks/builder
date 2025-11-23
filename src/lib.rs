@@ -1,7 +1,7 @@
 use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::{
     DeriveInput, Expr, Field, Ident, LitStr, Token, Type, Visibility, parse::Parse,
     spanned::Spanned,
@@ -9,22 +9,34 @@ use syn::{
 
 struct BuilderField {
     ident: Ident,
+    #[allow(unused)]
     vis: Visibility,
     ty: Type,
     attr: BuilderAttr,
     missing_err: Option<Ident>,
+    wrapped_option: bool,
 }
 
 #[derive(Default)]
 struct BuilderAttr {
     default: Option<Expr>,
+    into: bool,
 }
 
 impl Parse for BuilderAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let default = if input.peek(syn::Ident) {
+        let mut out = BuilderAttr::default();
+
+        while input.peek(syn::Ident) {
             let ident: Ident = input.parse()?;
-            if ident.to_string() == "default" {
+            if ident == "default" {
+                if out.default.is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "`default` may only be used once.",
+                    ));
+                }
+
                 let value: Expr = if input.peek(Token![=]) {
                     let _: Token![=] = input.parse()?;
                     let s: LitStr = input.parse()?;
@@ -33,15 +45,20 @@ impl Parse for BuilderAttr {
                     syn::parse_quote! { ::core::default::Default::default() }
                 };
 
-                Some(value)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+                out.default = Some(value)
+            } else if ident == "into" {
+                if out.into {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "`default` may only be used once.",
+                    ));
+                }
 
-        Ok(BuilderAttr { default })
+                out.into = true
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -49,16 +66,47 @@ impl TryFrom<&Field> for BuilderField {
     type Error = syn::Error;
 
     fn try_from(value: &Field) -> Result<Self, Self::Error> {
-        let attr: BuilderAttr =
+        let mut attr: BuilderAttr =
             if let Some(builder_attr) = value.attrs.iter().find(|a| a.path().is_ident("builder")) {
                 builder_attr.parse_args()?
             } else {
                 BuilderAttr::default()
             };
+
+        let (ty, wrapped_option) = match &value.ty {
+            Type::Path(path)
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "Option")
+                    && path.path.segments.len() == 1 =>
+            'x: {
+                let option = path
+                    .path
+                    .segments
+                    .last()
+                    .expect("checked in guard condition");
+
+                let arg = match &option.arguments {
+                    syn::PathArguments::AngleBracketed(args) if args.args.len() == 1 => {
+                        let Some(syn::GenericArgument::Type(arg)) = args.args.first() else {
+                            break 'x (value.ty.clone(), false);
+                        };
+                        arg.clone()
+                    }
+                    _ => break 'x (value.ty.clone(), false),
+                };
+                attr.default = Some(syn::parse_quote! { ::core::option::Option::None });
+                (arg, true)
+            }
+            _ => (value.ty.clone(), false),
+        };
+
         Ok(BuilderField {
             ident: value.ident.clone().unwrap(),
             vis: value.vis.clone(),
-            ty: value.ty.clone(),
+            ty,
             missing_err: if attr.default.is_none() {
                 let mut ident = format_ident!(
                     "Missing{}",
@@ -75,6 +123,7 @@ impl TryFrom<&Field> for BuilderField {
                 None
             },
             attr,
+            wrapped_option,
         })
     }
 }
@@ -140,10 +189,19 @@ pub fn builder(input: TokenStream) -> TokenStream {
         .map(|f| {
             let ident = &f.ident;
             let ty = &f.ty;
+            let (source, value) = if f.attr.into {
+                (
+                    quote! { impl ::core::convert::Into<#ty> },
+                    quote! { ::core::convert::Into::into(#ident) },
+                )
+            } else {
+                (ty.to_token_stream(), ident.to_token_stream())
+            };
+
             quote! {
-                #vis fn #ident(self, #ident: #ty) -> Self {
+                #vis fn #ident(self, #ident: #source) -> Self {
                     let mut this = self;
-                    this.#ident = Some(#ident);
+                    this.#ident = Some(#value);
                     this
                 }
             }
@@ -156,7 +214,11 @@ pub fn builder(input: TokenStream) -> TokenStream {
 
     let build_fields = fields_named.iter().map(|field| {
         let name = &field.ident;
-        if let Some(default) = &field.attr.default {
+        if field.wrapped_option {
+            quote! {
+                #name: self.#name
+            }
+        } else if let Some(default) = &field.attr.default {
             quote! {
                 #name: self.#name.unwrap_or_else(|| #default)
             }
@@ -184,14 +246,14 @@ pub fn builder(input: TokenStream) -> TokenStream {
         impl #builder {
             #functions
 
-            #vis fn build(self) -> Result<#ident, #build_err> {
+            #vis fn build(self) -> ::core::result::Result<#ident, #build_err> {
                 Ok(#ident {
                     #(#build_fields),*
                 })
             }
         }
 
-        impl Default for #builder {
+        impl ::core::default::Default for #builder {
             fn default() -> Self {
                 Self {
                     #(#field_names: None),*
@@ -201,7 +263,7 @@ pub fn builder(input: TokenStream) -> TokenStream {
 
         impl #ident {
             #vis fn builder() -> #builder {
-                Default::default()
+                ::core::default::Default::default()
             }
         }
     }
