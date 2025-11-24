@@ -39,14 +39,27 @@
 //! );
 //! ```
 
+use std::str::FromStr;
+
 use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, format_ident, quote};
 use syn::{
     DeriveInput, Expr, ExprRange, Field, Ident, LitStr, Token, Type, Visibility,
-    parse::ParseStream, parse_macro_input, spanned::Spanned,
+    parse::{Parse, ParseStream},
+    parse_macro_input,
+    spanned::Spanned,
 };
+
+macro_rules! bail {
+    ($span: expr => $message: literal $(, $args: expr)*$(,)?) => {
+        return Err(syn::Error::new(
+            $span,
+            format!($message, $($args),*),
+        ))
+    }
+}
 
 fn get_single_generic<'a>(ty: &'a Type, name: Option<&str>) -> Option<&'a Type> {
     match ty {
@@ -87,7 +100,7 @@ struct BuilderField {
     #[allow(unused)]
     vis: Visibility,
     ty: Type,
-    attr: BuilderAttr,
+    attr: FieldAttr,
     missing_err: Option<Ident>,
     wrapped_option: bool,
 }
@@ -99,7 +112,7 @@ struct Repeat {
 }
 
 #[derive(Default)]
-struct BuilderAttr {
+struct FieldAttr {
     /// Some(Some(expr)) -> default is expr
     /// Some(None) -> default is Default::default()
     /// None -> no default
@@ -108,18 +121,9 @@ struct BuilderAttr {
     repeat: Option<Repeat>,
 }
 
-macro_rules! bail {
-    ($span: expr => $message: literal $(, $args: expr)*$(,)?) => {
-        return Err(syn::Error::new(
-            $span,
-            format!($message, $($args),*),
-        ))
-    }
-}
-
-impl BuilderAttr {
+impl FieldAttr {
     fn parse(input: syn::parse::ParseStream, field: &Field) -> syn::Result<Self> {
-        let mut out = BuilderAttr::default();
+        let mut out = FieldAttr::default();
         let field_ident = field.ident.as_ref().unwrap();
 
         while input.peek(syn::Ident) {
@@ -206,13 +210,12 @@ impl TryFrom<&Field> for BuilderField {
 
     fn try_from(value: &Field) -> Result<Self, Self::Error> {
         let ident = value.ident.as_ref().expect("We only support named fields");
-        let attr: BuilderAttr = if let Some(builder_attr) =
-            value.attrs.iter().find(|a| a.path().is_ident("builder"))
-        {
-            builder_attr.parse_args_with(|input: ParseStream| BuilderAttr::parse(input, value))?
-        } else {
-            BuilderAttr::default()
-        };
+        let attr: FieldAttr =
+            if let Some(builder_attr) = value.attrs.iter().find(|a| a.path().is_ident("builder")) {
+                builder_attr.parse_args_with(|input: ParseStream| FieldAttr::parse(input, value))?
+            } else {
+                FieldAttr::default()
+            };
 
         let (ty, wrapped_option) = if let Some(ty) = get_single_generic(&value.ty, Some("Option")) {
             (ty, true)
@@ -237,12 +240,82 @@ impl TryFrom<&Field> for BuilderField {
     }
 }
 
+#[derive(Default)]
+enum Kind {
+    #[default]
+    Owned,
+    Borrowed,
+    // TypeState,
+}
+
+impl FromStr for Kind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "owned" => Ok(Self::Owned),
+            "borrowed" => Ok(Self::Borrowed),
+            // "type-state" => Ok(Self::TypeState),
+            _ => Err(format!(
+                "Unknown kind \"{}\".  Valid kinds are: \"owned\", \"borrowed\"",
+                s
+            )),
+        }
+    }
+}
+
+impl Parse for Kind {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let s: LitStr = input.parse()?;
+        match Kind::from_str(&s.value()) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(syn::Error::new(s.span(), e)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct BuilderAttr {
+    kind: Kind,
+}
+
+impl Parse for BuilderAttr {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut out = Self::default();
+
+        while input.peek(syn::Ident) {
+            let ident: Ident = input.parse()?;
+            if ident == "kind" {
+                let _: Token![=] = input.parse()?;
+                out.kind = input.parse()?;
+            }
+
+            if input.peek(Token![,]) {
+                let _: Token![,] = input.parse()?;
+            } else {
+                break;
+            }
+        }
+
+        Ok(out)
+    }
+}
+
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn builder(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let ident = &input.ident;
-    // TODO: custom visiblity of builder
     let vis = &input.vis;
+
+    let attr = input.attrs.iter().find(|a| a.path().is_ident("builder"));
+    let attr: BuilderAttr = if let Some(attr) = attr {
+        match attr.parse_args() {
+            Ok(a) => a,
+            Err(e) => return e.to_compile_error().into(),
+        }
+    } else {
+        Default::default()
+    };
 
     let data_struct = match input.data {
         syn::Data::Struct(ref data_struct) => data_struct,
@@ -299,6 +372,11 @@ pub fn builder(input: TokenStream) -> TokenStream {
         })
         .collect();
 
+    let (prefix, ret) = match attr.kind {
+        Kind::Owned => (quote! { mut }, quote! { Self }),
+        Kind::Borrowed => (quote! { &mut }, quote! { &mut Self }),
+    };
+
     let functions: TokenStream2 = fields_named
         .iter()
         .map(|f| {
@@ -323,18 +401,16 @@ pub fn builder(input: TokenStream) -> TokenStream {
             if f.attr.repeat.is_some() {
                 let vec = &f.ident;
                 quote! {
-                    #vis fn #ident(self, #ident: #source) -> Self {
-                        let mut this = self;
-                        this.#vec.push(#value);
-                        this
+                    #vis fn #ident(#prefix self, #ident: #source) -> #ret {
+                        self.#vec.push(#value);
+                        self
                     }
                 }
             } else {
                 quote! {
-                    #vis fn #ident(self, #ident: #source) -> Self {
-                        let mut this = self;
-                        this.#ident = Some(#value);
-                        this
+                    #vis fn #ident(#prefix self, #ident: #source) -> #ret {
+                        self.#ident = Some(#value);
+                        self
                     }
                 }
             }
@@ -367,13 +443,13 @@ pub fn builder(input: TokenStream) -> TokenStream {
             if let Some((range, err)) = len {
                 quote! {
                     #name: match self.#name.len() {
-                        #range => self.#name.into_iter().collect(),
+                        #range => self.#name.drain(..).collect(),
                         len => return Err(#build_err::#err(len)),
                     }
                 }
             } else {
                 quote! {
-                    #name: self.#name.into_iter().collect()
+                    #name: self.#name.drain(..).collect()
                 }
             }
         } else if field.wrapped_option {
@@ -384,16 +460,16 @@ pub fn builder(input: TokenStream) -> TokenStream {
             if let Some(default) = default {
                 if field.attr.into {
                     quote! {
-                        #name: self.#name.unwrap_or_else(|| #default.into())
+                        #name: self.#name.take().unwrap_or_else(|| #default.into())
                     }
                 } else {
                     quote! {
-                        #name: self.#name.unwrap_or_else(|| #default)
+                        #name: self.#name.take().unwrap_or_else(|| #default)
                     }
                 }
             } else {
                 quote! {
-                    #name: self.#name.unwrap_or_else(|| ::core::default::Default::default())
+                    #name: self.#name.take().unwrap_or_else(|| ::core::default::Default::default())
                 }
             }
         } else {
@@ -402,7 +478,7 @@ pub fn builder(input: TokenStream) -> TokenStream {
                 .as_ref()
                 .expect("missing_err is set when default is none");
             quote! {
-                #name: self.#name.ok_or(#build_err::#err)?
+                #name: self.#name.take().ok_or(#build_err::#err)?
             }
         }
     });
@@ -420,7 +496,7 @@ pub fn builder(input: TokenStream) -> TokenStream {
         impl #builder {
             #functions
 
-            #vis fn build(self) -> ::core::result::Result<#ident, #build_err> {
+            #vis fn build(#prefix self) -> ::core::result::Result<#ident, #build_err> {
                 Ok(#ident {
                     #(#build_fields),*
                 })

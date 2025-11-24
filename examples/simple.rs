@@ -1,6 +1,7 @@
 use builder::Builder;
 
 #[derive(Debug, Builder, PartialEq)]
+#[builder(kind = "asdlkf")]
 pub struct Foo {
     pub field_a: u32,
     #[builder(default)]
