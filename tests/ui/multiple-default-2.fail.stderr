@@ -1,0 +1,5 @@
+error: `default` may only be used once.
+ --> tests/ui/multiple-default-2.fail.rs:5:42
+  |
+5 |     #[builder(default = "String::new()", default)]
+  |                                          ^^^^^^^

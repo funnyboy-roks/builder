@@ -1,0 +1,5 @@
+error: `default` cannot be added with `repeat`
+ --> tests/ui/repeat-default.fail.rs:5:23
+  |
+5 |     #[builder(repeat, default = "String::new()")]
+  |                       ^^^^^^^

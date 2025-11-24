@@ -1,0 +1,5 @@
+error: `repeat_n` may only be used with `repeat`
+ --> tests/ui/repeat-n-no-repeat.fail.rs:5:15
+  |
+5 |     #[builder(repeat_n)]
+  |               ^^^^^^^^

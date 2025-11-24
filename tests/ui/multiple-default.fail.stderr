@@ -1,0 +1,5 @@
+error: `default` may only be used once.
+ --> tests/ui/multiple-default.fail.rs:5:24
+  |
+5 |     #[builder(default, default)]
+  |                        ^^^^^^^
