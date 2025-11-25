@@ -39,6 +39,7 @@
 //! );
 //! ```
 
+use std::fmt::Write;
 use std::str::FromStr;
 
 use convert_case::{Case, Casing};
@@ -106,7 +107,6 @@ struct BuilderField {
 }
 
 struct Repeat {
-    ident: Ident,
     inner_ty: Type,
     len: Option<(ExprRange, Ident)>,
 }
@@ -119,6 +119,9 @@ struct FieldAttr {
     default: Option<Option<Expr>>,
     into: bool,
     repeat: Option<Repeat>,
+    rename: Option<Ident>,
+    skip_prefix: bool,
+    skip_suffix: bool,
 }
 
 impl FieldAttr {
@@ -161,20 +164,11 @@ impl FieldAttr {
                     bail!(ident.span() => "`repeat` cannot be added with `default`");
                 }
 
-                let value: Ident = if input.peek(Token![=]) {
-                    let _: Token![=] = input.parse()?;
-                    let s: LitStr = input.parse()?;
-                    s.parse()?
-                } else {
-                    field_ident.clone()
-                };
-
                 let Some(inner) = get_single_generic(&field.ty, None) else {
                     bail!(field.ty.span() => "Cannot repeat on value with no generics");
                 };
 
                 out.repeat = Some(Repeat {
-                    ident: value,
                     inner_ty: inner.clone(),
                     len: None,
                 });
@@ -192,6 +186,27 @@ impl FieldAttr {
                     format_ident!("Range{}", field_ident.to_string().to_case(Case::Pascal));
                 ident.set_span(ident.span());
                 rep.len = Some((input.parse()?, ident));
+            } else if ident == "rename" {
+                if out.rename.is_some() {
+                    bail!(ident.span() => "`rename` may only be used once.");
+                }
+
+                let _: Token![=] = input.parse()?;
+                let s: LitStr = input.parse()?;
+
+                out.rename = Some(s.parse()?);
+            } else if ident == "skip_prefix" {
+                if out.skip_prefix {
+                    bail!(ident.span() => "`skip_prefix` may only be used once.");
+                }
+                out.skip_prefix = true;
+            } else if ident == "skip_suffix" {
+                if out.skip_suffix {
+                    bail!(ident.span() => "`skip_suffix` may only be used once.");
+                }
+                out.skip_suffix = true;
+            } else {
+                bail!(ident.span() => r#"Unknown attribute "{}".  Valid attribute are: "default", "into", "repeat", "repeat_n", "rename", "skip_prefix", "skip_suffix""#, ident);
             }
 
             if input.peek(Token![,]) {
@@ -240,7 +255,7 @@ impl TryFrom<&Field> for BuilderField {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 enum Kind {
     #[default]
     Owned,
@@ -274,9 +289,11 @@ impl Parse for Kind {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct BuilderAttr {
     kind: Kind,
+    prefix: String,
+    suffix: String,
 }
 
 impl Parse for BuilderAttr {
@@ -288,6 +305,14 @@ impl Parse for BuilderAttr {
             if ident == "kind" {
                 let _: Token![=] = input.parse()?;
                 out.kind = input.parse()?;
+            } else if ident == "prefix" {
+                let _: Token![=] = input.parse()?;
+                out.prefix = input.parse::<LitStr>()?.value();
+            } else if ident == "suffix" {
+                let _: Token![=] = input.parse()?;
+                out.suffix = input.parse::<LitStr>()?.value();
+            } else {
+                bail!(ident.span() => r#"Unknown attribute "{}".  Valid attribute are: "kind", "prefix", "suffix""#, ident);
             }
 
             if input.peek(Token![,]) {
@@ -316,6 +341,8 @@ pub fn builder(input: TokenStream) -> TokenStream {
     } else {
         Default::default()
     };
+
+    dbg!(&attr);
 
     let data_struct = match input.data {
         syn::Data::Struct(ref data_struct) => data_struct,
@@ -380,35 +407,40 @@ pub fn builder(input: TokenStream) -> TokenStream {
     let functions: TokenStream2 = fields_named
         .iter()
         .map(|f| {
-            let (ty, ident) = if let Some(Repeat {
-                ident, inner_ty, ..
-            }) = &f.attr.repeat
-            {
-                (inner_ty, ident)
-            } else {
-                (&f.ty, &f.ident)
-            };
+            let field_name = &f.ident;
+            let ident = f.attr.rename.as_ref().unwrap_or(&f.ident);
+            let ty = f.attr.repeat.as_ref().map(|r| &r.inner_ty).unwrap_or(&f.ty);
+
+            let mut fn_ident = String::with_capacity(attr.prefix.len() + attr.suffix.len());
+            if !f.attr.skip_prefix {
+                fn_ident.push_str(&attr.prefix);
+            }
+            write!(fn_ident, "{}", ident).expect("Inserting into string will never fail");
+            if !f.attr.skip_suffix {
+                fn_ident.push_str(&attr.suffix);
+            }
+            let fn_ident = Ident::new(&fn_ident, ident.span());
 
             let (source, value) = if f.attr.into {
                 (
                     quote! { impl ::core::convert::Into<#ty> },
-                    quote! { ::core::convert::Into::into(#ident) },
+                    quote! { ::core::convert::Into::into(#field_name) },
                 )
             } else {
-                (ty.to_token_stream(), ident.to_token_stream())
+                (ty.to_token_stream(), field_name.to_token_stream())
             };
 
             if f.attr.repeat.is_some() {
                 let vec = &f.ident;
                 quote! {
-                    #vis fn #ident(#prefix self, #ident: #source) -> #ret {
+                    #vis fn #fn_ident(#prefix self, #field_name: #source) -> #ret {
                         self.#vec.push(#value);
                         self
                     }
                 }
             } else {
                 quote! {
-                    #vis fn #ident(#prefix self, #ident: #source) -> #ret {
+                    #vis fn #fn_ident(#prefix self, #field_name: #source) -> #ret {
                         self.#ident = Some(#value);
                         self
                     }

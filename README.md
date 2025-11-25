@@ -11,7 +11,7 @@ pub struct Foo {
     field_b: bool,
     #[builder(into)]
     field_c: String,
-    #[builder(repeat, repeat_n = 1..3)]
+    #[builder(repeat, repeat_n = 1..=3)]
     field_d: Vec<f32>,
 }
 
