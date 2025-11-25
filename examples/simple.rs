@@ -1,7 +1,7 @@
-use builder::Builder;
+use bauer::Builder;
 
 #[derive(Debug, Builder)]
-#[builder(kind = "owned", prefix = "set_")]
+#[builder(kind = "owned", prefix = "set_", visibility = pub(crate))]
 pub struct Foo {
     #[builder(default = "42")]
     pub field_a: u32,
@@ -22,5 +22,6 @@ fn main() {
         .add_d(2.72)
         .build()
         .unwrap();
+
     dbg!(x);
 }

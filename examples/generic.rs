@@ -1,4 +1,4 @@
-use builder::Builder;
+use bauer::Builder;
 
 #[derive(Debug, Builder)]
 pub struct Foo<T> {

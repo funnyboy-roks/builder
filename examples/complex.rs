@@ -1,10 +1,10 @@
-use builder::Builder;
+use bauer::Builder;
 
 #[derive(Debug, Builder, PartialEq)]
-#[builder(kind = "borrowed", prefix = "set_", suffix = "_value")]
+#[builder(kind = "borrowed")]
 pub struct Foo {
     pub field_a: u32,
-    #[builder(default, foo)]
+    #[builder(default)]
     pub field_b: u32,
     #[builder(default = "42")]
     pub field_c: u32,
@@ -16,7 +16,7 @@ pub struct Foo {
     pub field_f: String,
     #[builder(repeat)]
     pub field_g: Vec<u32>,
-    #[builder(repeat = "field_h_single")]
+    #[builder(repeat, rename = "field_h_single")]
     pub field_h: Vec<u32>,
     #[builder(repeat, repeat_n = 1..=3)]
     pub field_i: Vec<u32>,
@@ -24,7 +24,7 @@ pub struct Foo {
 
 fn main() {
     let x = Foo::builder()
-        .set_field_a_value(5)
+        .field_a(5)
         .field_f("world")
         .field_g(0)
         .field_g(1)

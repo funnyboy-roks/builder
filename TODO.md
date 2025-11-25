@@ -3,6 +3,6 @@
 - [x] add `#[builder(rename = "")]`
 - [x] add mutable builder (`&mut self`)
 - [ ] add type-state builder
-- [ ] add custom visibility of builder
+- [x] add custom visibility of builder
 - [x] handle generics
-- [ ] enums for field attributes
+- [x] enums for field attributes

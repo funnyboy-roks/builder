@@ -1,68 +1,39 @@
-//! # Builder
-//!
-//! A simple builder derive macro, with the intention of accomplishing all
-//! needs from a builder.
+//! A derive macro for automatically generating the builder pattern
 //!
 //! ```rust
-//! # use builder::Builder;
+//! use bauer::Builder;
+//!
 //! # const _: &str = stringify!(
 //! #[derive(Builder)]
 //! # );
 //! # #[derive(Builder, PartialEq, Debug)]
 //! pub struct Foo {
-//!     #[builder(default = "42")]
-//!     field_a: u32,
-//!     field_b: bool,
-//!     #[builder(into)]
-//!     field_c: String,
-//!     #[builder(repeat, repeat_n = 1..4)]
-//!     field_d: Vec<f32>,
+//!     bar: u32,
 //! }
 //!
 //! let foo: Foo = Foo::builder()
-//!     .field_b(true)
-//!     .field_c("hello world")
-//!     .field_d(3.14)
-//!     .field_d(6.28)
-//!     .field_d(2.72)
+//!     .bar(42)
 //!     .build()
 //!     .unwrap();
 //!
-//! assert_eq!(
-//!     foo,
-//!     Foo {
-//!         field_a: 42,
-//!         field_b: true,
-//!         field_c: String::from("hello world"),
-//!         field_d: vec![3.14, 6.28, 2.72],
-//!     },
-//! );
+//! assert_eq!(foo, Foo { bar: 42, });
 //! ```
 
-use std::fmt::Write;
-use std::str::FromStr;
-
-use convert_case::{Case, Casing};
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{ToTokens, format_ident, quote};
-use syn::{
-    DeriveInput, Expr, ExprRange, Field, Ident, LitStr, Token, Type, Visibility,
-    parse::{Parse, ParseStream},
-    parse_macro_input,
-    spanned::Spanned,
+use quote::{ToTokens, format_ident, quote, quote_spanned};
+use std::fmt::Write;
+use syn::{DeriveInput, Ident, Type, parse::ParseStream, parse_macro_input, spanned::Spanned};
+
+use crate::{
+    builder::{BuilderAttr, Kind},
+    field::{BuilderField, Repeat},
 };
 
-macro_rules! bail {
-    ($span: expr => $message: literal $(, $args: expr)*$(,)?) => {
-        return Err(syn::Error::new(
-            $span,
-            format!($message, $($args),*),
-        ))
-    }
-}
+mod builder;
+mod field;
 
-fn get_single_generic<'a>(ty: &'a Type, name: Option<&str>) -> Option<&'a Type> {
+pub(crate) fn get_single_generic<'a>(ty: &'a Type, name: Option<&str>) -> Option<&'a Type> {
     match ty {
         Type::Path(path)
             if path
@@ -96,236 +67,238 @@ fn get_single_generic<'a>(ty: &'a Type, name: Option<&str>) -> Option<&'a Type> 
     }
 }
 
-struct BuilderField {
-    ident: Ident,
-    #[allow(unused)]
-    vis: Visibility,
-    ty: Type,
-    attr: FieldAttr,
-    missing_err: Option<Ident>,
-    wrapped_option: bool,
-}
-
-struct Repeat {
-    inner_ty: Type,
-    len: Option<(ExprRange, Ident)>,
-}
-
-#[derive(Default)]
-struct FieldAttr {
-    /// Some(Some(expr)) -> default is expr
-    /// Some(None) -> default is Default::default()
-    /// None -> no default
-    default: Option<Option<Expr>>,
-    into: bool,
-    repeat: Option<Repeat>,
-    rename: Option<Ident>,
-    skip_prefix: bool,
-    skip_suffix: bool,
-}
-
-impl FieldAttr {
-    fn parse(input: syn::parse::ParseStream, field: &Field) -> syn::Result<Self> {
-        let mut out = FieldAttr::default();
-        let field_ident = field.ident.as_ref().unwrap();
-
-        while input.peek(syn::Ident) {
-            let ident: Ident = input.parse()?;
-            if ident == "default" {
-                if out.default.is_some() {
-                    bail!(ident.span() => "`default` may only be used once.");
-                }
-
-                if out.repeat.is_some() {
-                    bail!(ident.span() => "`default` cannot be added with `repeat`");
-                }
-
-                let value: Option<Expr> = if input.peek(Token![=]) {
-                    let _: Token![=] = input.parse()?;
-                    let s: LitStr = input.parse()?;
-                    Some(s.parse()?)
-                } else {
-                    None
-                };
-
-                out.default = Some(value)
-            } else if ident == "into" {
-                if out.into {
-                    bail!(ident.span() => "`into` may only be used once.");
-                }
-
-                out.into = true
-            } else if ident == "repeat" {
-                if out.repeat.is_some() {
-                    bail!(ident.span() => "`repeat` may only be used once.");
-                }
-
-                if out.default.is_some() {
-                    bail!(ident.span() => "`repeat` cannot be added with `default`");
-                }
-
-                let Some(inner) = get_single_generic(&field.ty, None) else {
-                    bail!(field.ty.span() => "Cannot repeat on value with no generics");
-                };
-
-                out.repeat = Some(Repeat {
-                    inner_ty: inner.clone(),
-                    len: None,
-                });
-            } else if ident == "repeat_n" {
-                let Some(rep) = &mut out.repeat else {
-                    bail!(ident.span() => "`repeat_n` may only be used with `repeat`");
-                };
-
-                if rep.len.is_some() {
-                    bail!(ident.span() => "`repeat_n` may only be used once.");
-                }
-
-                let _: Token![=] = input.parse()?;
-                let mut ident =
-                    format_ident!("Range{}", field_ident.to_string().to_case(Case::Pascal));
-                ident.set_span(ident.span());
-                rep.len = Some((input.parse()?, ident));
-            } else if ident == "rename" {
-                if out.rename.is_some() {
-                    bail!(ident.span() => "`rename` may only be used once.");
-                }
-
-                let _: Token![=] = input.parse()?;
-                let s: LitStr = input.parse()?;
-
-                out.rename = Some(s.parse()?);
-            } else if ident == "skip_prefix" {
-                if out.skip_prefix {
-                    bail!(ident.span() => "`skip_prefix` may only be used once.");
-                }
-                out.skip_prefix = true;
-            } else if ident == "skip_suffix" {
-                if out.skip_suffix {
-                    bail!(ident.span() => "`skip_suffix` may only be used once.");
-                }
-                out.skip_suffix = true;
-            } else {
-                bail!(ident.span() => r#"Unknown attribute "{}".  Valid attribute are: "default", "into", "repeat", "repeat_n", "rename", "skip_prefix", "skip_suffix""#, ident);
-            }
-
-            if input.peek(Token![,]) {
-                let _: Token![,] = input.parse()?;
-            } else {
-                break;
-            }
-        }
-
-        Ok(out)
-    }
-}
-
-impl TryFrom<&Field> for BuilderField {
-    type Error = syn::Error;
-
-    fn try_from(value: &Field) -> Result<Self, Self::Error> {
-        let ident = value.ident.as_ref().expect("We only support named fields");
-        let attr: FieldAttr =
-            if let Some(builder_attr) = value.attrs.iter().find(|a| a.path().is_ident("builder")) {
-                builder_attr.parse_args_with(|input: ParseStream| FieldAttr::parse(input, value))?
-            } else {
-                FieldAttr::default()
-            };
-
-        let (ty, wrapped_option) = if let Some(ty) = get_single_generic(&value.ty, Some("Option")) {
-            (ty, true)
-        } else {
-            (&value.ty, false)
-        };
-
-        Ok(BuilderField {
-            ident: ident.clone(),
-            vis: value.vis.clone(),
-            ty: ty.clone(),
-            missing_err: if attr.default.is_none() && attr.repeat.is_none() {
-                let mut ident = format_ident!("Missing{}", ident.to_string().to_case(Case::Pascal));
-                ident.set_span(value.ident.as_ref().unwrap().span());
-                Some(ident)
-            } else {
-                None
-            },
-            attr,
-            wrapped_option,
-        })
-    }
-}
-
-#[derive(Debug, Default)]
-enum Kind {
-    #[default]
-    Owned,
-    Borrowed,
-    // TypeState,
-}
-
-impl FromStr for Kind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "owned" => Ok(Self::Owned),
-            "borrowed" => Ok(Self::Borrowed),
-            // "type-state" => Ok(Self::TypeState),
-            _ => Err(format!(
-                "Unknown kind \"{}\".  Valid kinds are: \"owned\", \"borrowed\"",
-                s
-            )),
-        }
-    }
-}
-
-impl Parse for Kind {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let s: LitStr = input.parse()?;
-        match Kind::from_str(&s.value()) {
-            Ok(v) => Ok(v),
-            Err(e) => Err(syn::Error::new(s.span(), e)),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct BuilderAttr {
-    kind: Kind,
-    prefix: String,
-    suffix: String,
-}
-
-impl Parse for BuilderAttr {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let mut out = Self::default();
-
-        while input.peek(syn::Ident) {
-            let ident: Ident = input.parse()?;
-            if ident == "kind" {
-                let _: Token![=] = input.parse()?;
-                out.kind = input.parse()?;
-            } else if ident == "prefix" {
-                let _: Token![=] = input.parse()?;
-                out.prefix = input.parse::<LitStr>()?.value();
-            } else if ident == "suffix" {
-                let _: Token![=] = input.parse()?;
-                out.suffix = input.parse::<LitStr>()?.value();
-            } else {
-                bail!(ident.span() => r#"Unknown attribute "{}".  Valid attribute are: "kind", "prefix", "suffix""#, ident);
-            }
-
-            if input.peek(Token![,]) {
-                let _: Token![,] = input.parse()?;
-            } else {
-                break;
-            }
-        }
-
-        Ok(out)
-    }
-}
-
+/// The main macro.
+///
+/// ## Usage
+///
+/// ```
+/// use bauer::Builder;
+///
+/// #[derive(Builder)]
+/// pub struct Foo {
+///     #[builder(default = "42")]
+///     pub field_a: u32,
+///     pub field_b: bool,
+///     #[builder(into)]
+///     pub field_c: String,
+///     #[builder(repeat, repeat_n = 1..=3)]
+///     pub field_d: Vec<f64>,
+/// }
+/// ```
+///
+/// ## Builder Attributes
+///
+/// ### **`kind`**
+///
+/// Possible values: `"owned"`, `"borrowed"`  
+/// Default: `"owned"`
+///
+/// Whether the builder should be passed around as an owned value or a mutable reference.
+///
+/// ```
+/// # use bauer::Builder;
+/// #[derive(Builder)]
+/// #[builder(kind = "borrowed")]
+/// pub struct Foo {
+///     a: u32,
+/// }
+/// ```
+///
+/// ### **`prefix`**/**`suffix`**
+///
+/// Default: `prefix = "", suffix = ""`
+///
+/// Set the prefix or suffix for the generated builder functions
+///
+/// ```
+/// # use bauer::Builder;
+/// #[derive(Builder)]
+/// #[builder(prefix = "set_")]
+/// pub struct Foo {
+///     a: u32,
+/// }
+///
+/// let f = Foo::builder()
+///     .set_a(42)
+///     .build()
+///     .unwrap();
+/// ```
+///
+/// ### **`visibility`**
+///
+/// Default: visibility of the struct
+///
+/// Set the visibilty for the created builder
+///
+/// ```
+/// # use bauer::Builder;
+/// #[derive(Builder)]
+/// #[builder(visibility = pub(crate))]
+/// pub struct Foo {
+///     a: u32,
+/// }
+/// ```
+///
+/// ## Fields Attributes
+///
+/// ### **`default`**
+///
+/// Argument: Optional String
+///
+/// If provided, the field does not need to be specified, and will default to the value provided.
+/// If not value is provided to the `default` attribute, then [`Default::default`] will be used.
+///
+/// ```
+/// # use bauer::Builder;
+/// # const _: &str = stringify!(
+/// #[derive(Builder)]
+/// # );
+/// # #[derive(Builder, PartialEq, Debug)]
+/// pub struct Foo {
+///     #[builder(default)]
+///     a: u32, // defaults to 0
+///     #[builder(default = "std::f32::consts::PI")]
+///     b: f32, // defaults to PI
+/// }
+///
+/// let foo = Foo::builder()
+///     .build()
+///     .unwrap();
+/// assert_eq!(foo, Foo { a: 0, b: std::f32::consts::PI });
+///
+/// let foo = Foo::builder()
+///     .a(42)
+///     .build()
+///     .unwrap();
+/// assert_eq!(foo, Foo { a: 42, b: std::f32::consts::PI });
+/// ```
+///
+/// ### **`into`**
+///
+/// Make the method accept anything can be turned into the field.
+///
+/// ```
+/// # use bauer::Builder;
+/// # const _: &str = stringify!(
+/// #[derive(Builder)]
+/// # );
+/// # #[derive(Builder, PartialEq, Debug)]
+/// pub struct Foo {
+///     #[builder(into)]
+///     a: String,
+/// }
+///
+/// let foo = Foo::builder()
+///     .a("hello")
+///     .build()
+///     .unwrap();
+/// assert_eq!(foo, Foo { a: String::from("hello") });
+/// ```
+///
+/// ### **`repeat`**
+///
+/// Make the method accept only a single item and build a list from it
+///
+/// ```
+/// # use bauer::Builder;
+/// # const _: &str = stringify!(
+/// #[derive(Builder)]
+/// # );
+/// # #[derive(Builder, PartialEq, Debug)]
+/// pub struct Foo {
+///     #[builder(repeat)]
+///     items: Vec<u32>,
+/// }
+///
+/// let foo = Foo::builder()
+///     .items(0)
+///     .items(1)
+///     .items(2)
+///     .build()
+///     .unwrap();
+/// assert_eq!(foo, Foo { items: vec![0, 1, 2] });
+/// ```
+///
+/// ### **`repeat_n`**
+///
+/// Attribute `repeat` must also be specified.
+///
+/// Ensure that the length of items supplied via repeat is within a certain range.  If this range
+/// is not met, an error will be returned.
+///
+/// ```
+/// # use bauer::Builder;
+/// # const _: &str = stringify!(
+/// #[derive(Builder)]
+/// # );
+/// # #[derive(Builder, PartialEq, Debug)]
+/// pub struct Foo {
+///     #[builder(repeat, repeat_n = 2..=3)]
+///     items: Vec<u32>,
+/// }
+///
+/// let foo = Foo::builder()
+///     .items(0)
+///     .items(1)
+///     .items(2)
+///     .build()
+///     .unwrap();
+/// assert_eq!(foo, Foo { items: vec![0, 1, 2] });
+///
+/// let foo = Foo::builder()
+///     .items(0)
+///     .build()
+///     .unwrap_err();
+/// assert_eq!(foo, FooBuildError::RangeItems(1));
+/// ```
+///
+/// ### **`rename`**
+///
+/// Make the function that is generated use a different name from field itself.
+///
+/// ```
+/// # use bauer::Builder;
+/// # const _: &str = stringify!(
+/// #[derive(Builder)]
+/// # );
+/// # #[derive(Builder, PartialEq, Debug)]
+/// pub struct Foo {
+///     #[builder(repeat, rename = "item")]
+///     items: Vec<u32>,
+/// }
+///
+/// let foo = Foo::builder()
+///     .item(0)
+///     .item(1)
+///     .build()
+///     .unwrap();
+/// assert_eq!(foo, Foo { items: vec![0, 1] });
+/// ```
+///
+/// ### **`skip_prefix`**/**`skip_suffix`**
+///
+/// If a prefix or a suffix is specified in the builder attributes, skip applying those to the name
+/// of this function.  This is epecially useful with `rename`.
+///
+/// ```
+/// # use bauer::Builder;
+/// # const _: &str = stringify!(
+/// #[derive(Builder)]
+/// # );
+/// # #[derive(Builder, PartialEq, Debug)]
+/// #[builder(prefix = "set_")]
+/// pub struct Foo {
+///     #[builder(repeat, rename = "item", skip_prefix)]
+///     items: Vec<u32>,
+/// }
+///
+/// let foo = Foo::builder()
+///     .item(0)
+///     .item(1)
+///     .build()
+///     .unwrap();
+/// assert_eq!(foo, Foo { items: vec![0, 1] });
+/// ```
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn builder(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -334,15 +307,13 @@ pub fn builder(input: TokenStream) -> TokenStream {
 
     let attr = input.attrs.iter().find(|a| a.path().is_ident("builder"));
     let attr: BuilderAttr = if let Some(attr) = attr {
-        match attr.parse_args() {
+        match attr.parse_args_with(|ps: ParseStream| BuilderAttr::parse(ps, vis.clone())) {
             Ok(a) => a,
             Err(e) => return e.to_compile_error().into(),
         }
     } else {
-        Default::default()
+        BuilderAttr::new(vis.clone())
     };
-
-    dbg!(&attr);
 
     let data_struct = match input.data {
         syn::Data::Struct(ref data_struct) => data_struct,
@@ -357,6 +328,12 @@ pub fn builder(input: TokenStream) -> TokenStream {
                 .into();
         }
     };
+
+    let (prefix, ret) = match attr.kind {
+        Kind::Owned => (quote! { mut }, quote! { Self }),
+        Kind::Borrowed => (quote! { &mut }, quote! { &mut Self }),
+    };
+    let builder_vis = attr.vis;
 
     let builder = format_ident!("{}Builder", ident);
     let build_err = format_ident!("{}BuildError", ident);
@@ -399,11 +376,6 @@ pub fn builder(input: TokenStream) -> TokenStream {
         })
         .collect();
 
-    let (prefix, ret) = match attr.kind {
-        Kind::Owned => (quote! { mut }, quote! { Self }),
-        Kind::Borrowed => (quote! { &mut }, quote! { &mut Self }),
-    };
-
     let functions: TokenStream2 = fields_named
         .iter()
         .map(|f| {
@@ -433,14 +405,14 @@ pub fn builder(input: TokenStream) -> TokenStream {
             if f.attr.repeat.is_some() {
                 let vec = &f.ident;
                 quote! {
-                    #vis fn #fn_ident(#prefix self, #field_name: #source) -> #ret {
+                    fn #fn_ident(#prefix self, #field_name: #source) -> #ret {
                         self.#vec.push(#value);
                         self
                     }
                 }
             } else {
                 quote! {
-                    #vis fn #fn_ident(#prefix self, #field_name: #source) -> #ret {
+                    fn #fn_ident(#prefix self, #field_name: #source) -> #ret {
                         self.#ident = Some(#value);
                         self
                     }
@@ -500,7 +472,8 @@ pub fn builder(input: TokenStream) -> TokenStream {
                     }
                 }
             } else {
-                quote! {
+                quote_spanned! {
+                    field.ty.span() =>
                     #name: self.#name.take().unwrap_or_else(|| ::core::default::Default::default())
                 }
             }
@@ -518,19 +491,19 @@ pub fn builder(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     quote! {
-        #[derive(::std::fmt::Debug)]
-        #vis enum #build_err {
+        #[derive(::std::fmt::Debug, ::std::cmp::PartialEq, ::std::cmp::Eq)]
+        #builder_vis enum #build_err {
             #(#build_err_variants),*
         }
 
-        #vis struct #builder #ty_generics {
+        #builder_vis struct #builder #ty_generics {
             #fields
         }
 
         impl #impl_generics #builder #ty_generics #where_clause {
             #functions
 
-            #vis fn build(#prefix self) -> ::core::result::Result<#ident #ty_generics, #build_err> {
+            #builder_vis fn build(#prefix self) -> ::core::result::Result<#ident #ty_generics, #build_err> {
                 Ok(#ident {
                     #(#build_fields),*
                 })
@@ -546,7 +519,7 @@ pub fn builder(input: TokenStream) -> TokenStream {
         }
 
         impl #impl_generics #ident #ty_generics #where_clause {
-            #vis fn builder() -> #builder #ty_generics {
+            #builder_vis fn builder() -> #builder #ty_generics {
                 ::core::default::Default::default()
             }
         }
