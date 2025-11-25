@@ -515,27 +515,29 @@ pub fn builder(input: TokenStream) -> TokenStream {
         }
     });
 
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
     quote! {
         #[derive(::std::fmt::Debug)]
         #vis enum #build_err {
             #(#build_err_variants),*
         }
 
-        #vis struct #builder {
+        #vis struct #builder #ty_generics {
             #fields
         }
 
-        impl #builder {
+        impl #impl_generics #builder #ty_generics #where_clause {
             #functions
 
-            #vis fn build(#prefix self) -> ::core::result::Result<#ident, #build_err> {
+            #vis fn build(#prefix self) -> ::core::result::Result<#ident #ty_generics, #build_err> {
                 Ok(#ident {
                     #(#build_fields),*
                 })
             }
         }
 
-        impl ::core::default::Default for #builder {
+        impl #impl_generics ::core::default::Default for #builder #ty_generics #where_clause {
             fn default() -> Self {
                 Self {
                     #(#field_names: ::core::default::Default::default()),*
@@ -543,8 +545,8 @@ pub fn builder(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl #ident {
-            #vis fn builder() -> #builder {
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #vis fn builder() -> #builder #ty_generics {
                 ::core::default::Default::default()
             }
         }
